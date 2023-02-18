@@ -3,7 +3,8 @@ all : everything
 DTC:=buildroot/output/host/bin/dtc
 
 buildroot :
-	git clone https://github.com/cnlohr/buildroot --recurse-submodules --depth 1
+	ln -s ../riscv-buildroot buildroot
+	#git clone https://github.com/cnlohr/buildroot --recurse-submodules --depth 1
 
 toolchain : buildroot
 	cp -a configs/custom_kernel_config buildroot/kernel_config
@@ -51,9 +52,10 @@ configs/minimal.dtb : configs/minimal.dts $(DTC)
 # Trick for extracting the DTB from 
 dtbextract : $(DTC)
 	# Need 	sudo apt  install device-tree-compiler
-	cd buildroot && output/host/bin/qemu-system-riscv32 -cpu rv32,mmu=false -m 128M -machine virt -nographic -kernel output/images/Image -bios none -drive file=output/images/rootfs.ext2,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -machine dumpdtb=../dtb.dtb && cd ..
+	(cd buildroot && output/host/bin/qemu-system-riscv32 -cpu rv32,mmu=false -m 128M -machine virt -nographic -kernel output/images/Image -bios none -drive file=output/images/rootfs.ext2,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -machine dumpdtb=../dtb.dtb)
 	$(DTC) -I dtb -O dts -o dtb.dts dtb.dtb
 
 tests :
 	git clone https://github.com/riscv-software-src/riscv-tests
 	./configure --prefix=
+
