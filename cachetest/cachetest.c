@@ -1,18 +1,15 @@
-// Copyright 2022 Charles Lohr, you may use this file or any portions herein under any of the BSD, MIT, or CC0 licenses.
+// This test is actually more of a test of a lot of the functionality that is 
+// used for vrc-rv32ima.  To make sure the added functionality (like cache and
+// custom mulh) will work as expected.
 
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
 
-#include "default64mbdtc.h"
+#define MINI_RV32_RAM_SIZE 0x3FF8000
+#define MINIRV32_IMPLEMENTATION
 
-// Just default RAM amount is 64MB.
-uint32_t ram_amt = 64*1024*1024;
-int fail_on_all_faults = 0;
-
-static int64_t SimpleReadNumberInt( const char * number, int64_t defaultNumber );
 static uint64_t GetTimeMicroseconds();
 static void ResetKeyboardInput();
 static void CaptureKeyboardInput();
@@ -25,89 +22,234 @@ static void MiniSleep();
 static int IsKBHit();
 static int ReadKBByte();
 
-// This is the functionality we want to override in the emulator.
-//  think of this as the way the emulator's processor is connected to the outside world.
+int fail_on_all_faults = 1;
+uint8_t * ram_image = 0;
+struct MiniRV32IMAState * core;
+
 #define MINIRV32WARN( x... ) printf( x );
 #define MINIRV32_DECORATE  static
-#define MINI_RV32_RAM_SIZE ram_amt
 #define MINIRV32_IMPLEMENTATION
-#define MINIRV32_POSTEXEC( pc, ir, retval ) { if( retval > 0 ) { if( fail_on_all_faults ) { printf( "FAULT\n" ); return 3; } else retval = HandleException( ir, retval ); } }
 #define MINIRV32_HANDLE_MEM_STORE_CONTROL( addy, val ) if( HandleControlStore( addy, val ) ) return val;
 #define MINIRV32_HANDLE_MEM_LOAD_CONTROL( addy, rval ) rval = HandleControlLoad( addy );
 #define MINIRV32_OTHERCSR_WRITE( csrno, value ) HandleOtherCSRWrite( image, csrno, value );
 #define MINIRV32_OTHERCSR_READ( csrno, value ) value = HandleOtherCSRRead( image, csrno );
 
-#include "mini-rv32ima.h"
+typedef uint32_t uint4[4];
+typedef uint32_t uint;
+int icount;
+#define MAXICOUNT 1024
 
-uint8_t * ram_image = 0;
-struct MiniRV32IMAState * core;
-const char * kernel_command_line = 0;
+#define uint4assign( a, b ) memcpy( a, b, sizeof( uint32_t ) * 4 )
+#define MainSystemAccess( blockno ) (&ram_image[(blockno)*16])
+#define precise
+#define AS_SIGNED(val) ((int32_t)(val))
+#define AS_UNSIGNED(val) ((uint32_t)(val))
+
+///////////////////////////////////////////////////////////////////////////////
+// Section from shader.
+///////////////////////////////////////////////////////////////////////////////
+			static uint4 cachesetsdata[1024];
+			static uint  cachesetsaddy[1024];
+			static uint  storeblockcount;
+			static uint  need_to_flush_runlet;
+
+			// Always aligned-to-4-bytes.
+			uint LoadMemInternalRB( uint ptr )
+			{
+				int i;
+				uint blockno = ptr / 16;
+				uint hash = blockno & 0x7f;
+				uint4 block;
+				uint ct = 0;
+				for( i = hash; i += 128; i<1024 )
+				{
+					ct = cachesetsaddy[i];
+					if( ct == 0 ) break;
+					if( ct == ptr )
+					{
+						// Found block.
+						uint4assign( block, cachesetsdata[i] );
+					}
+				}
+				if( ct == 0 )
+				{
+					// else, no block found. Read data.
+					uint4assign( block, MainSystemAccess( blockno ) );
+				}
+				return block[(ptr&0xf)>>2];
+			}
+
+
+			// todo: review all this.
+			void StoreMemInternalRB( uint ptr, uint val )
+			{
+				int i;
+				uint blockno = ptr / 16;
+				// ptr will be aligned.
+				// perform a 4-byte store.
+				uint hash = blockno & 0x7f;
+				uint4 block;
+				uint ct = 0;
+				// Cache lines are 8-deep, by 16 bytes, with 128 possible cache addresses.
+				for( i = hash; i += 128; i<1024 )
+				{
+					ct = cachesetsaddy[i];
+					if( ct == 0 ) break;
+					if( ct == ptr )
+					{
+						// Found block.
+						cachesetsdata[i][(ptr&0xf)>>2] = val;
+						return;
+					}
+				}
+				// NOTE: It should be impossible for i to ever be or exceed 1024.
+				if( i >= (1024-128) )
+				{
+					// We have filled a cache line.  We must cleanup without any other stores.
+					need_to_flush_runlet = 1;
+				}
+				cachesetsaddy[i] = blockno;
+				uint4assign( block, MainSystemAccess( blockno ) );
+				block[(ptr&0xf)>>2] = val;
+				uint4assign( cachesetsdata[i], block );
+				storeblockcount++;
+				// Make sure there's enough room to flush processor state (16 writes)
+				if( storeblockcount >= 112 ) need_to_flush_runlet = 1;
+			}
+
+			// NOTE: len does NOT control upper bits.
+			uint LoadMemInternal( uint ptr, uint len )
+			{
+				uint remo = ptr & 3;
+				if( remo )
+				{
+					if( len > 4 - remo )
+					{
+						// Must be split into two reads.
+						uint ret0 = LoadMemInternalRB( ptr & (~3) );
+						uint ret1 = LoadMemInternalRB( (ptr & (~3)) + 4 );
+						return (ret0 >> (remo*8)) | (ret1<<((4-remo)*8)); // XXX TODO:TESTME!!!
+					}
+					else
+					{
+						// Can just be one.
+						uint ret = LoadMemInternalRB( ptr & (~3) );
+						return ret >> (remo*8);
+					}
+				}
+				return LoadMemInternalRB( ptr );
+			}
+			
+			void StoreMemInternal( uint ptr, uint val, uint len )
+			{
+				uint remo = ptr & 3;
+				if( remo )
+				{
+					if( len > 4 - remo )
+					{
+						// Must be split into two writes.
+						uint ret0 = LoadMemInternalRB( ptr & (~3) );
+						uint ret1 = LoadMemInternalRB( (ptr & (~3)) + 4 );
+						uint loaded = (ret0 >> (remo*8)) | (ret1<<((4-remo)*8));
+						uint mask = (1<<(len*8))-1;
+						loaded = (loaded & (~mask)) | ( val & mask );
+						// XXX TODO
+					}
+					else
+					{
+						// Can just be one call.
+						uint ret = LoadMemInternalRB( ptr & (~3) );
+						return ret >> (remo*8);
+						// XXX TODO
+					}
+				}
+				if( len != 4 )
+				{
+					uint lv = LoadMemInternalRB( ptr );
+					// XXX TODO
+				}
+				else
+				{
+					StoreMemInternalRB( ptr, val );
+				}
+			}
+
+			#define MINIRV32_POSTEXEC( a, b, c ) ;
+
+			#define MINIRV32_CUSTOM_MEMORY_BUS
+			uint MINIRV32_LOAD4( uint ofs ) { return LoadMemInternal( ofs, 4 ); }
+			void MINIRV32_STORE4( uint ofs, uint val ) { StoreMemInternal( ofs, val, 4 ); if( need_to_flush_runlet ) icount = MAXICOUNT; }
+			uint MINIRV32_LOAD2( uint ofs ) { uint tword = LoadMemInternal( ofs, 2 ) & 0xffff; return tword; }
+			uint MINIRV32_LOAD1( uint ofs ) { uint tword = LoadMemInternal( ofs, 1 ) & 0xff; return tword; }
+			int MINIRV32_LOAD2_SIGNED( uint ofs ) { uint tword = LoadMemInternal( ofs, 2 ) & 0xffff; if( tword & 0x8000 ) tword |= 0xffff; return tword; }
+			int MINIRV32_LOAD1_SIGNED( uint ofs ) { uint tword = LoadMemInternal( ofs, 1 ) & 0xff;   if( tword & 0x80 ) tword |= 0xff; return tword; }
+			void MINIRV32_STORE2( uint ofs, uint val ) { StoreMemInternal( ofs, val, 2 ); if( need_to_flush_runlet ) icount = MAXICOUNT; }
+			void MINIRV32_STORE1( uint ofs, uint val ) { StoreMemInternal( ofs, val, 1 ); if( need_to_flush_runlet ) icount = MAXICOUNT; }
+
+			// From pi_maker's VRC RVC Linux
+			// https://github.com/PiMaker/rvc/blob/eb6e3447b2b54a07a0f90bb7c33612aeaf90e423/_Nix/rvc/src/emu.h#L255-L276
+			#define CUSTOM_MULH \
+				case 1: \
+				{ \
+				    /* FIXME: mulh-family instructions have to use double precision floating points internally atm... */ \
+					/* umul/imul (https://docs.microsoft.com/en-us/windows/win32/direct3dhlsl/umul--sm4---asm-)       */ \
+					/* do exist, but appear to be unusable?                                                           */ \
+					precise double op1 = AS_SIGNED(rs1); \
+					precise double op2 = AS_SIGNED(rs2); \
+					rval = (uint)((op1 * op2) / 4294967296.0l); /* '/ 4294967296' == '>> 32' */ \
+					break; \
+				} \
+				case 2: \
+				{ \
+					/* is the signed/unsigned stuff even correct? who knows... */ \
+					precise double op1 = AS_SIGNED(rs1); \
+					precise double op2 = AS_UNSIGNED(rs2); \
+					rval = (uint)((op1 * op2) / 4294967296.0l); /* '/ 4294967296' == '>> 32' */ \
+					break; \
+				} \
+				case 3: \
+				{ \
+					precise double op1 = AS_UNSIGNED(rs1); \
+					precise double op2 = AS_UNSIGNED(rs2); \
+					rval = (uint)((op1 * op2) / 4294967296.0l); /* '/ 4294967296' == '>> 32' */ \
+					break; \
+				}
+	
+
+
+
+///////////////////////////////////////////////////////////////////////////////
+// Done section from shader.
+///////////////////////////////////////////////////////////////////////////////
+
+
+
+#include "mini-rv32ima.h"
+#include "sixtyfourmb.dtb.h"
+
+#define ram_amt MINI_RV32_RAM_SIZE
 
 static void DumpState( struct MiniRV32IMAState * core, uint8_t * ram_image );
 
 int main( int argc, char ** argv )
 {
-	int i;
-	long long instct = -1;
-	int show_help = 0;
-	int time_divisor = 1;
-	int fixed_update = 0;
 	int do_sleep = 1;
-	int single_step = 0;
+	int fixed_update = 0;
 	int dtb_ptr = 0;
-	const char * image_file_name = 0;
-	const char * dtb_file_name = 0;
-	for( i = 1; i < argc; i++ )
-	{
-		const char * param = argv[i];
-		int param_continue = 0; // Can combine parameters, like -lpt x
-		do
-		{
-			if( param[0] == '-' || param_continue )
-			{
-				switch( param[1] )
-				{
-				case 'm': if( ++i < argc ) ram_amt = SimpleReadNumberInt( argv[i], ram_amt ); break;
-				case 'c': if( ++i < argc ) instct = SimpleReadNumberInt( argv[i], -1 ); break;
-				case 'k': if( ++i < argc ) kernel_command_line = argv[i]; break;
-				case 'f': image_file_name = (++i<argc)?argv[i]:0; break;
-				case 'b': dtb_file_name = (++i<argc)?argv[i]:0; break;
-				case 'l': param_continue = 1; fixed_update = 1; break;
-				case 'p': param_continue = 1; do_sleep = 0; break;
-				case 's': param_continue = 1; single_step = 1; break;
-				case 'd': param_continue = 1; fail_on_all_faults = 1; break; 
-				case 't': if( ++i < argc ) time_divisor = SimpleReadNumberInt( argv[i], 1 ); break;
-				default:
-					if( param_continue )
-						param_continue = 0;
-					else
-						show_help = 1;
-					break;
-				}
-			}
-			else
-			{
-				show_help = 1;
-				break;
-			}
-			param++;
-		} while( param_continue );
-	}
-	if( show_help || image_file_name == 0 || time_divisor <= 0 )
-	{
-		fprintf( stderr, "./mini-rv32imaf [parameters]\n\t-m [ram amount]\n\t-f [running image]\n\t-k [kernel command line]\n\t-b [dtb file, or 'disable']\n\t-c instruction count\n\t-s single step with full processor state\n\t-t time divion base\n\t-l lock time base to instruction count\n\t-p disable sleep when wfi\n\t-d fail out immediately on all faults\n" );
-		return 1;
-	}
+	int time_divisor = 1;
+	long long instct = -1;
 
 	ram_image = malloc( ram_amt );
+
+restart:
 	if( !ram_image )
 	{
 		fprintf( stderr, "Error: could not allocate system image.\n" );
 		return -4;
 	}
 
-restart:
 	{
+		const char * image_file_name = argv[1];
 		FILE * f = fopen( image_file_name, "rb" );
 		if( !f || ferror( f ) )
 		{
@@ -130,44 +272,11 @@ restart:
 			return -7;
 		}
 		fclose( f );
-
-		if( dtb_file_name )
-		{
-			if( strcmp( dtb_file_name, "disable" ) == 0 )
-			{
-				// No DTB reading.
-			}
-			else
-			{
-				f = fopen( dtb_file_name, "rb" );
-				if( !f || ferror( f ) )
-				{
-					fprintf( stderr, "Error: \"%s\" not found\n", dtb_file_name );
-					return -5;
-				}
-				fseek( f, 0, SEEK_END );
-				long dtblen = ftell( f );
-				fseek( f, 0, SEEK_SET );
-				dtb_ptr = ram_amt - dtblen - sizeof( struct MiniRV32IMAState );
-				if( fread( ram_image + dtb_ptr, dtblen, 1, f ) != 1 )
-				{
-					fprintf( stderr, "Error: Could not open dtb \"%s\"\n", dtb_file_name );
-					return -9;
-				}
-				fclose( f );
-			}
-		}
-		else
-		{
-			// Load a default dtb.
-			dtb_ptr = ram_amt - sizeof(default64mbdtb) - sizeof( struct MiniRV32IMAState );
-			memcpy( ram_image + dtb_ptr, default64mbdtb, sizeof( default64mbdtb ) );
-			if( kernel_command_line )
-			{
-				strncpy( (char*)( ram_image + dtb_ptr + 0xc0 ), kernel_command_line, 54 );
-			}
-		}
 	}
+
+	dtb_ptr = ram_amt - sizeof(default64mbdtb) - sizeof( struct MiniRV32IMAState );
+	memcpy( ram_image + dtb_ptr, default64mbdtb, sizeof( default64mbdtb ) );
+
 
 	CaptureKeyboardInput();
 
@@ -178,22 +287,9 @@ restart:
 	core->regs[11] = dtb_ptr?(dtb_ptr+MINIRV32_RAM_IMAGE_OFFSET):0; //dtb_pa (Must be valid pointer) (Should be pointer to dtb)
 	core->extraflags |= 3; // Machine-mode.
 
-	if( dtb_file_name == 0 )
-	{
-		// Update system ram size in DTB (but if and only if we're using the default DTB)
-		// Warning - this will need to be updated if the skeleton DTB is ever modified.
-		uint32_t * dtb = (uint32_t*)(ram_image + dtb_ptr);
-		if( dtb[0x13c/4] == 0x00c0ff03 )
-		{
-			uint32_t validram = dtb_ptr;
-			dtb[0x13c/4] = (validram>>24) | ((( validram >> 16 ) & 0xff) << 8 ) | (((validram>>8) & 0xff ) << 16 ) | ( ( validram & 0xff) << 24 );
-		}
-	}
-
-	// Image is loaded.
 	uint64_t rt;
 	uint64_t lastTime = (fixed_update)?0:(GetTimeMicroseconds()/time_divisor);
-	int instrs_per_flip = single_step?1:1024;
+	int instrs_per_flip = MAXICOUNT;
 	for( rt = 0; rt < instct+1 || instct < 0; rt += instrs_per_flip )
 	{
 		uint64_t * this_ccount = ((uint64_t*)&core->cyclel);
@@ -204,8 +300,8 @@ restart:
 			elapsedUs = GetTimeMicroseconds()/time_divisor - lastTime;
 		lastTime += elapsedUs;
 
-		if( single_step )
-			DumpState( core, ram_image);
+		//if( single_step )
+		//	DumpState( core, ram_image);
 
 		int ret = MiniRV32IMAStep( core, ram_image, 0, elapsedUs, instrs_per_flip ); // Execute upto 1024 cycles before breaking out.
 		switch( ret )
@@ -218,14 +314,8 @@ restart:
 			default: printf( "Unknown failure\n" ); break;
 		}
 	}
-
-	DumpState( core, ram_image);
 }
 
-
-//////////////////////////////////////////////////////////////////////////
-// Platform-specific functionality
-//////////////////////////////////////////////////////////////////////////
 
 
 #if defined(WINDOWS) || defined(WIN32) || defined(_WIN32)
@@ -504,4 +594,5 @@ static void DumpState( struct MiniRV32IMAState * core, uint8_t * ram_image )
 		regs[16], regs[17], regs[18], regs[19], regs[20], regs[21], regs[22], regs[23],
 		regs[24], regs[25], regs[26], regs[27], regs[28], regs[29], regs[30], regs[31] );
 }
+
 

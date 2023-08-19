@@ -27,17 +27,17 @@ Image-emdoom-MAX_ORDER_14 :
 	unzip Image-emdoom-MAX_ORDER_14.zip
 
 testdoom : Image-emdoom-MAX_ORDER_14 mini-rv32ima
-	./mini-rv32ima -f Image-emdoom-MAX_ORDER_14 -m 0x3000000
+	./mini-rv32ima -f Image-emdoom-MAX_ORDER_14 -m 0x3000000 -k "console=ttyS0"
 
 testkern : mini-rv32ima
-	./mini-rv32ima -f ../buildroot/output/images/Image -m 0x6000000
+	./mini-rv32ima -f ../buildroot/output/images/Image -m 0x6000000 -k "console=hvc0"
 
 testbare : mini-rv32ima
 	./mini-rv32ima -f ../baremetal/baremetal.bin
 
 DownloadedImage :
-	wget https://github.com/cnlohr/mini-rv32ima-images/raw/master/images/linux-5.18.0-rv32nommu-cnl-1.zip -O linux-5.18.0-rv32nommu-cnl-1.zip
-	unzip linux-5.18.0-rv32nommu-cnl-1.zip
+	wget https://github.com/cnlohr/mini-rv32ima-images/raw/master/images/linux-6.1.14-rv32nommu-cnl-1.zip -O linux-6.1.14-rv32nommu-cnl-1.zip
+	unzip linux-6.1.14-rv32nommu-cnl-1.zip
 	mv Image DownloadedImage
 
 testdlimage : mini-rv32ima DownloadedImage
@@ -60,6 +60,10 @@ default64mbdtc.h : sixtyfourmb.dtb bintoh
 	./bintoh default64mbdtb < $< > $@
 	# WARNING: sixtyfourmb.dtb MUST hvave at least 16 bytes of buffer room AND be 16-byte aligned.
 	#  dtc -I dts -O dtb -o sixtyfourmb.dtb sixtyfourmb.dts -S 1536
+
+sixtyfourmb.dtb : sixtyfourmb.dts
+	dtc -I dts -O dtb -o $@ $^ -S 1536
+
 
 dumpkern :
 	../buildroot/output/host/bin/riscv32-buildroot-linux-uclibc-objdump -S ../buildroot/output/build/linux-5.18/vmlinux >fw_payload.S

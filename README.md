@@ -92,8 +92,8 @@ Everything else: Contact us on my Discord: https://discord.com/invite/CCeyWyZ
  * @vowstar and their team working on [k210-linux-nommu](https://github.com/vowstar/k210-linux-nommu).
  * This [guide](https://jborza.com/emulation/2020/04/09/riscv-environment.html)
  * [rvcodecjs](https://luplab.gitlab.io/rvcodecjs/) I probably went through over 1,000 codes here.
-
-
+ * @splinedrive from the [KianV RISC-V noMMU SoC](https://github.com/splinedrive/kianRiscV/tree/master/linux_socs/kianv_harris_mcycle_edition?s=09) project.
+ 
 ## More details
 
 If you want to build the kernel yourself:
@@ -163,4 +163,12 @@ make
 ```
 
 Note: For emdoom you will need to modify include/linux/mmzone.h and change MAX_ORDER to 13.
+
+### Buildroot Notes
+
+Add this:
+https://github.com/cnlohr/buildroot/pull/1/commits/bc890f74354e7e2f2b1cf7715f6ef334ff6ed1b2
+
+Use this:
+https://github.com/cnlohr/buildroot/commit/e97714621bfae535d947817e98956b112eb80a75
 
