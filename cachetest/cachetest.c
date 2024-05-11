@@ -13,7 +13,6 @@
 static uint64_t GetTimeMicroseconds();
 static void ResetKeyboardInput();
 static void CaptureKeyboardInput();
-static uint32_t HandleException( uint32_t ir, uint32_t retval );
 static uint32_t HandleControlStore( uint32_t addy, uint32_t val );
 static uint32_t HandleControlLoad( uint32_t addy );
 static void HandleOtherCSRWrite( uint8_t * image, uint16_t csrno, uint32_t value );
@@ -24,6 +23,7 @@ static int ReadKBByte();
 
 int fail_on_all_faults = 1;
 uint8_t * ram_image = 0;
+uint8_t * ram_image_shadow = 0;
 struct MiniRV32IMAState * core;
 
 #define MINIRV32WARN( x... ) printf( x );
@@ -36,7 +36,7 @@ struct MiniRV32IMAState * core;
 
 typedef uint32_t uint4[4];
 typedef uint32_t uint;
-int icount;
+
 #define MAXICOUNT 1024
 
 #define uint4assign( a, b ) memcpy( a, b, sizeof( uint32_t ) * 4 )
@@ -45,187 +45,71 @@ int icount;
 #define AS_SIGNED(val) ((int32_t)(val))
 #define AS_UNSIGNED(val) ((uint32_t)(val))
 
+// Results, Booting Image.ProfileTest
+//                                             vvv this is # of times memory was filled.
+// 1024 / 4  > POWEROFF@0x00000000643a3945 // 11877 / 1654514
+//  384 / 3  > POWEROFF@0x0000000064268147 // 33481 / 1664185
+// 3072 / 3  > POWEROFF@0x00000000643fca65 // 2766 / 1649972
+// 1024 / 8  > POWEROFF@0x00000000644d3efd // 3525 / 1651561         
+// 1029 / 7  > POWEROFF@0x00000000644a3453 // 3511 / 1651337
+// 1023 / 3  > POWEROFF@0x000000006442b3c1 // 18722 / 1660258
+//  635 / 5  > POWEROFF@0x00000000643ed80f // 7016 / 1652821
+// Adding a max fcnt (Equivelent to # of points able to be output from shader.
+//  768 /  635 / 3 /  POWEROFF@0x00000000644affab // 24579 / 1662754
+//  768 / 1022 / 2 /  POWEROFF@0x00000000642d0e4b // 78297 / 1690837
+//  768 / 969  / 3 /  POWEROFF@0x00000000643ad1ce // 8486 / 1651512
+//  768 / 969  / 1 /  POWEROFF@0x0000000020d77858 // 45056097 / 45087974  <<< This is not a valid check, please ignore it.
+//  768 / 966  / 2 /  POWEROFF@0x00000000643fbd2d // 49606 / 1681855
+//  512 / 966  / 2 /  POWEROFF@0x00000000643d1311 // 62878 / 1690250  << Why is this any different?
+//  512 / 512  / 2 /  POWEROFF@0x000000006442f1c8 // 69580 / 1690151  << Interesting. 
+
 ///////////////////////////////////////////////////////////////////////////////
 // Section from shader.
 ///////////////////////////////////////////////////////////////////////////////
-			static uint4 cachesetsdata[1024];
-			static uint  cachesetsaddy[1024];
-			static uint  storeblockcount;
-			static uint  need_to_flush_runlet;
 
-			// Always aligned-to-4-bytes.
-			uint LoadMemInternalRB( uint ptr )
-			{
-				int i;
-				uint blockno = ptr / 16;
-				uint hash = blockno & 0x7f;
-				uint4 block;
-				uint ct = 0;
-				for( i = hash; i += 128; i<1024 )
-				{
-					ct = cachesetsaddy[i];
-					if( ct == 0 ) break;
-					if( ct == ptr )
-					{
-						// Found block.
-						uint4assign( block, cachesetsdata[i] );
-					}
-				}
-				if( ct == 0 )
-				{
-					// else, no block found. Read data.
-					uint4assign( block, MainSystemAccess( blockno ) );
-				}
-				return block[(ptr&0xf)>>2];
-			}
-
-
-			// todo: review all this.
-			void StoreMemInternalRB( uint ptr, uint val )
-			{
-				int i;
-				uint blockno = ptr / 16;
-				// ptr will be aligned.
-				// perform a 4-byte store.
-				uint hash = blockno & 0x7f;
-				uint4 block;
-				uint ct = 0;
-				// Cache lines are 8-deep, by 16 bytes, with 128 possible cache addresses.
-				for( i = hash; i += 128; i<1024 )
-				{
-					ct = cachesetsaddy[i];
-					if( ct == 0 ) break;
-					if( ct == ptr )
-					{
-						// Found block.
-						cachesetsdata[i][(ptr&0xf)>>2] = val;
-						return;
-					}
-				}
-				// NOTE: It should be impossible for i to ever be or exceed 1024.
-				if( i >= (1024-128) )
-				{
-					// We have filled a cache line.  We must cleanup without any other stores.
-					need_to_flush_runlet = 1;
-				}
-				cachesetsaddy[i] = blockno;
-				uint4assign( block, MainSystemAccess( blockno ) );
-				block[(ptr&0xf)>>2] = val;
-				uint4assign( cachesetsdata[i], block );
-				storeblockcount++;
-				// Make sure there's enough room to flush processor state (16 writes)
-				if( storeblockcount >= 112 ) need_to_flush_runlet = 1;
-			}
-
-			// NOTE: len does NOT control upper bits.
-			uint LoadMemInternal( uint ptr, uint len )
-			{
-				uint remo = ptr & 3;
-				if( remo )
-				{
-					if( len > 4 - remo )
-					{
-						// Must be split into two reads.
-						uint ret0 = LoadMemInternalRB( ptr & (~3) );
-						uint ret1 = LoadMemInternalRB( (ptr & (~3)) + 4 );
-						return (ret0 >> (remo*8)) | (ret1<<((4-remo)*8)); // XXX TODO:TESTME!!!
-					}
-					else
-					{
-						// Can just be one.
-						uint ret = LoadMemInternalRB( ptr & (~3) );
-						return ret >> (remo*8);
-					}
-				}
-				return LoadMemInternalRB( ptr );
-			}
-			
-			void StoreMemInternal( uint ptr, uint val, uint len )
-			{
-				uint remo = ptr & 3;
-				if( remo )
-				{
-					if( len > 4 - remo )
-					{
-						// Must be split into two writes.
-						uint ret0 = LoadMemInternalRB( ptr & (~3) );
-						uint ret1 = LoadMemInternalRB( (ptr & (~3)) + 4 );
-						uint loaded = (ret0 >> (remo*8)) | (ret1<<((4-remo)*8));
-						uint mask = (1<<(len*8))-1;
-						loaded = (loaded & (~mask)) | ( val & mask );
-						// XXX TODO
-					}
-					else
-					{
-						// Can just be one call.
-						uint ret = LoadMemInternalRB( ptr & (~3) );
-						return ret >> (remo*8);
-						// XXX TODO
-					}
-				}
-				if( len != 4 )
-				{
-					uint lv = LoadMemInternalRB( ptr );
-					// XXX TODO
-				}
-				else
-				{
-					StoreMemInternalRB( ptr, val );
-				}
-			}
-
-			#define MINIRV32_POSTEXEC( a, b, c ) ;
-
-			#define MINIRV32_CUSTOM_MEMORY_BUS
-			uint MINIRV32_LOAD4( uint ofs ) { return LoadMemInternal( ofs, 4 ); }
-			void MINIRV32_STORE4( uint ofs, uint val ) { StoreMemInternal( ofs, val, 4 ); if( need_to_flush_runlet ) icount = MAXICOUNT; }
-			uint MINIRV32_LOAD2( uint ofs ) { uint tword = LoadMemInternal( ofs, 2 ) & 0xffff; return tword; }
-			uint MINIRV32_LOAD1( uint ofs ) { uint tword = LoadMemInternal( ofs, 1 ) & 0xff; return tword; }
-			int MINIRV32_LOAD2_SIGNED( uint ofs ) { uint tword = LoadMemInternal( ofs, 2 ) & 0xffff; if( tword & 0x8000 ) tword |= 0xffff; return tword; }
-			int MINIRV32_LOAD1_SIGNED( uint ofs ) { uint tword = LoadMemInternal( ofs, 1 ) & 0xff;   if( tword & 0x80 ) tword |= 0xff; return tword; }
-			void MINIRV32_STORE2( uint ofs, uint val ) { StoreMemInternal( ofs, val, 2 ); if( need_to_flush_runlet ) icount = MAXICOUNT; }
-			void MINIRV32_STORE1( uint ofs, uint val ) { StoreMemInternal( ofs, val, 1 ); if( need_to_flush_runlet ) icount = MAXICOUNT; }
-
-			// From pi_maker's VRC RVC Linux
-			// https://github.com/PiMaker/rvc/blob/eb6e3447b2b54a07a0f90bb7c33612aeaf90e423/_Nix/rvc/src/emu.h#L255-L276
-			#define CUSTOM_MULH \
-				case 1: \
-				{ \
-				    /* FIXME: mulh-family instructions have to use double precision floating points internally atm... */ \
-					/* umul/imul (https://docs.microsoft.com/en-us/windows/win32/direct3dhlsl/umul--sm4---asm-)       */ \
-					/* do exist, but appear to be unusable?                                                           */ \
-					precise double op1 = AS_SIGNED(rs1); \
-					precise double op2 = AS_SIGNED(rs2); \
-					rval = (uint)((op1 * op2) / 4294967296.0l); /* '/ 4294967296' == '>> 32' */ \
-					break; \
-				} \
-				case 2: \
-				{ \
-					/* is the signed/unsigned stuff even correct? who knows... */ \
-					precise double op1 = AS_SIGNED(rs1); \
-					precise double op2 = AS_UNSIGNED(rs2); \
-					rval = (uint)((op1 * op2) / 4294967296.0l); /* '/ 4294967296' == '>> 32' */ \
-					break; \
-				} \
-				case 3: \
-				{ \
-					precise double op1 = AS_UNSIGNED(rs1); \
-					precise double op2 = AS_UNSIGNED(rs2); \
-					rval = (uint)((op1 * op2) / 4294967296.0l); /* '/ 4294967296' == '>> 32' */ \
-					break; \
-				}
-	
-
-
+#include "gpucache.h"
 
 ///////////////////////////////////////////////////////////////////////////////
 // Done section from shader.
 ///////////////////////////////////////////////////////////////////////////////
 
+// This will need to be written by the cache user.
+void FlushRunlet()
+{
+	int k;
+
+	int cachefillecout = 0;
+	int do_debug_flash_flush = 0;
+	if( do_debug_flash_flush ) printf( "[" );
+	for( k = 0; k < sizeof( cachesetsaddy ) / sizeof( cachesetsaddy[0] ); k++ )
+	{
+		int a = cachesetsaddy[k];
+		if( a )
+		{
+			int addybase = (a - 1) << 4;
+			int j;
+			for( j = 0; j < 4; j++ )
+			{
+				*((uint32_t*)(&ram_image[addybase])) = cachesetsdata[k][j];
+				addybase +=4;
+			}
+			cachesetsaddy[k] = 0;
+			cachefillecout++;
+		}
+
+		if( k % (CACHE_N_WAY) == (CACHE_N_WAY) - 1) 
+		{
+			if( do_debug_flash_flush ) printf( "%d", cachefillecout ); 
+			cachefillecout = 0;
+		}
+	}
+	if( do_debug_flash_flush ) printf( "]\n" );
+	cache_usage = 0;
+}
 
 
 #include "mini-rv32ima.h"
-#include "sixtyfourmb.dtb.h"
+#include "default64mbdtc.h"
 
 #define ram_amt MINI_RV32_RAM_SIZE
 
@@ -240,13 +124,196 @@ int main( int argc, char ** argv )
 	long long instct = -1;
 
 	ram_image = malloc( ram_amt );
+	ram_image_shadow = malloc( ram_amt );
 
-restart:
 	if( !ram_image )
 	{
 		fprintf( stderr, "Error: could not allocate system image.\n" );
 		return -4;
 	}
+
+//#define UNITTEST
+
+#ifdef UNITTEST
+
+	int j;
+	int rseed = 2;
+	int ctct = 0;
+	printf( "Block-aligned-test: Expect collisions, but the collisions should be OK\n" );
+	srand( rseed );
+	memset( ram_image, 0, ram_amt );
+	for( j = 0; j < 300000; j++ )
+	{
+		uint addr = rand() & 2097151;
+		uint val = rand();
+		uint v = LoadMemInternalRB( addr*4 );
+		if( v )
+		{
+			//printf( "Collision Test at %d %d %d\n", addr, v, val );
+			ctct++;
+		}
+		StoreMemInternalRB( addr*4, val );
+		if( cache_usage >= MAX_FCNT )
+		{
+			FlushRunlet();
+		}
+	}
+	FlushRunlet();
+	srand( rseed );
+	for( j = 0; j < 300000; j++ )
+	{
+		uint addr = rand() & 2097151;
+		uint val = rand();
+		uint32_t r = LoadMemInternalRB( addr*4 );
+		if( r != val )
+		{
+			//printf( "%d disagrees %d @ %d\n", val, r, addr*4 );
+			ctct--;
+		}
+	}
+
+	if( ctct )
+	{
+		fprintf( stderr, "Error: Cache test (def) failed\n" );
+		return -9;
+	}
+	memset( ram_image, 0, ram_amt );
+
+	printf( "Base test OK\n" );
+	srand( rseed );
+	for( j = 0; j < 2000; j++ )
+	{
+		uint addr = rand() & 2097151;
+		uint val = rand();
+		uint v = LoadMemInternal( addr, 4 );
+		if( v )
+		{
+			printf( "Collision Test at %d %d %d\n", addr, v, val );
+			ctct++;
+		}
+		StoreMemInternal( addr, val, 4 );
+		if( cache_usage >= MAX_FCNT )
+		{
+			FlushRunlet();
+		}
+	}
+	FlushRunlet();
+	srand( rseed );
+	for( j = 0; j < 2000; j++ )
+	{
+		uint addr = rand() & 2097151;
+		uint val = rand();
+		uint32_t r = LoadMemInternal( addr, 4 );
+		if( r != val )
+		{
+			printf( "val %08x disagrees %08x @ %08x\n", val, r, addr );
+			ctct--;
+		}
+	}
+	if( ctct )
+	{
+		fprintf( stderr, "Error: Cache test (4) failed (%d)\n", ctct );
+		return -9;
+	}
+	printf( "4 test OK\n" );
+	memset( ram_image, 0, ram_amt );
+
+
+	srand( rseed );
+	for( j = 0; j < 20000; j++ )
+	{
+		uint addr = rand() & 2097151;
+		uint val = rand();
+		uint v = LoadMemInternal( addr, 4 );
+		StoreMemInternal( addr, val, 4 );
+		if( cache_usage >= MAX_FCNT)
+		{
+			FlushRunlet();
+		}
+		uint v2 = LoadMemInternal( addr, 4 );
+		if( val != v2 )
+		{
+			printf( "TEST FAILED Test at %08x (%08x != %08x) %08x\n", addr, v, v2, val );
+			return -10;
+		}
+	}
+	printf( "Cache test (4 B) OK\n" );
+	memset( ram_image, 0, ram_amt );
+
+	srand( rseed );
+	for( j = 0; j < 3000; j++ )
+	{
+		uint addr = rand() & 2097151;
+		uint val = rand();
+		uint len = (rand() & 3)+1;
+		val &= ((uint32_t)(-1))>>(32-len*8);
+		uint v = LoadMemInternal( addr, len );
+		if( v )
+		{
+			//printf( "Collision Test at %d %d %d\n", addr, v, val );
+			ctct++;
+		}
+		StoreMemInternal( addr, val, len );
+		if( cache_usage >= MAX_FCNT )
+		{
+			FlushRunlet();
+		}
+	}
+	FlushRunlet();
+	srand( rseed );
+	for( j = 0; j < 3000; j++ )
+	{
+		uint addr = rand() & 2097151;
+		uint val = rand();
+		uint len = (rand() & 3)+1;
+		val &= (((uint32_t)-1)>>(32-len*8));
+
+		uint32_t r = LoadMemInternal( addr, len );
+		if( r != val )
+		{
+			//printf( "%d disagrees %d @ %d\n", val, r, addr );
+			ctct--;
+		}
+	}
+
+	if( ctct )
+	{
+		fprintf( stderr, "Error: Cache test (r) failed\n" );
+		return -9;
+	}
+	memset( ram_image, 0, ram_amt );
+	printf( "Cache Test (R) OK\n" );
+
+
+	srand( rseed );
+	for( j = 0; j < 200000; j++ )
+	{
+		uint addr = rand() & 2097151;
+		uint val = rand();
+		uint len = (rand() & 3)+1;
+		val &= (((uint32_t)-1)>>(32-len*8));
+		uint v = LoadMemInternal( addr, len );
+		StoreMemInternal( addr, val, len );
+		if( cache_usage  >= MAX_FCNT)
+		{
+			FlushRunlet();
+		}
+		uint v2 = LoadMemInternal( addr, 4 );
+		v2 &= (((uint32_t)-1)>>(32-len*8));
+		if( val != v2 )
+		{
+			printf( "TEST FAILED Test at %08x (%08x != %08x) %08x\n", addr, v2, val, v );
+			return -10;
+		}
+	}
+	printf( "Cache test (R B) OK\n" );
+	memset( ram_image, 0, ram_amt );
+
+
+	exit(0  );
+#endif
+
+restart:
 
 	{
 		const char * image_file_name = argv[1];
@@ -278,6 +345,19 @@ restart:
 	memcpy( ram_image + dtb_ptr, default64mbdtb, sizeof( default64mbdtb ) );
 
 
+	// Update system ram size in DTB (but if and only if we're using the default DTB)
+	// Warning - this will need to be updated if the skeleton DTB is ever modified.
+	uint32_t * dtb = (uint32_t*)(ram_image + dtb_ptr);
+	if( dtb[0x13c/4] == 0x00c0ff03 )
+	{
+		uint32_t validram = dtb_ptr;
+		dtb[0x13c/4] = (validram>>24) | ((( validram >> 16 ) & 0xff) << 8 ) | (((validram>>8) & 0xff ) << 16 ) | ( ( validram & 0xff) << 24 );
+	}
+
+
+
+	memcpy( ram_image_shadow, ram_image, ram_amt );
+
 	CaptureKeyboardInput();
 
 	// The core lives at the end of RAM.
@@ -290,6 +370,8 @@ restart:
 	uint64_t rt;
 	uint64_t lastTime = (fixed_update)?0:(GetTimeMicroseconds()/time_divisor);
 	int instrs_per_flip = MAXICOUNT;
+	int total_exits = 0;
+	int cache_exits = 0;
 	for( rt = 0; rt < instct+1 || instct < 0; rt += instrs_per_flip )
 	{
 		uint64_t * this_ccount = ((uint64_t*)&core->cyclel);
@@ -304,13 +386,20 @@ restart:
 		//	DumpState( core, ram_image);
 
 		int ret = MiniRV32IMAStep( core, ram_image, 0, elapsedUs, instrs_per_flip ); // Execute upto 1024 cycles before breaking out.
+		if( cache_usage  >= MAX_FCNT)
+		{
+			FlushRunlet();
+			cache_exits++;
+		}
+		total_exits++;
+
 		switch( ret )
 		{
 			case 0: break;
 			case 1: if( do_sleep ) MiniSleep(); *this_ccount += instrs_per_flip; break;
 			case 3: instct = 0; break;
 			case 0x7777: goto restart;	//syscon code for restart
-			case 0x5555: printf( "POWEROFF@0x%08x%08x\n", core->cycleh, core->cyclel ); return 0; //syscon code for power-off
+			case 0x5555: printf( "POWEROFF@0x%08x%08x // %d / %d\n", core->cycleh, core->cyclel, cache_exits, total_exits ); return 0; //syscon code for power-off
 			default: printf( "Unknown failure\n" ); break;
 		}
 	}
@@ -475,15 +564,6 @@ static int IsKBHit()
 // Rest of functions functionality
 //////////////////////////////////////////////////////////////////////////
 
-static uint32_t HandleException( uint32_t ir, uint32_t code )
-{
-	// Weird opcode emitted by duktape on exit.
-	if( code == 3 )
-	{
-		// Could handle other opcodes here.
-	}
-	return code;
-}
 
 static uint32_t HandleControlStore( uint32_t addy, uint32_t val )
 {
